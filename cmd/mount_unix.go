@@ -439,6 +439,10 @@ func fuseFlags() []cli.Flag {
 			Usage:  "disable `default_permissions` option, only for testing",
 			Hidden: true,
 		},
+		&cli.BoolFlag{
+			Name:  "no-perms",
+			Usage: "disable permission checks",
+		},
 		&cli.StringFlag{
 			Name:  "max-fuse-io",
 			Usage: "maximum size for fuse request",
@@ -1136,6 +1140,7 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		logger.Warnf("On kernel versions below 5.11 (current: %d.%d), negative-entry-cache may cause concurrent check-then-create operations (e.g. mkdir -p) to fail in a distributed environment", major, minor)
 	}
 	conf.NonDefaultPermission = c.Bool("non-default-permission")
+	conf.NoPerms = c.Bool("no-perms")
 	rootSquash := c.String("root-squash")
 	allSquash := c.String("all-squash")
 	if allSquash != "" || rootSquash != "" {

@@ -143,6 +143,7 @@ type Config struct {
 	RootSquash           *AnonymousAccount `json:",omitempty"`
 	AllSquash            *AnonymousAccount `json:",omitempty"`
 	NonDefaultPermission bool              `json:",omitempty"`
+	NoPerms              bool              `json:",omitempty"`
 	UMask                uint16
 
 	Pid       int

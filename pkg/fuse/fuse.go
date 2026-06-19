@@ -508,7 +508,7 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 			opt.Options = append(opt.Options, strings.TrimSpace(n))
 		}
 	}
-	if !conf.NonDefaultPermission {
+	if !conf.NonDefaultPermission && !conf.NoPerms {
 		opt.Options = append(opt.Options, "default_permissions")
 	}
 	if runtime.GOOS == "darwin" {
@@ -576,7 +576,9 @@ func GenFuseOpt(conf *vfs.Config, options string, mt int, noxattr, noacl bool, m
 			opt.Options = append(opt.Options, strings.TrimSpace(n))
 		}
 	}
+	if !conf.NonDefaultPermission && !conf.NoPerms {
 	opt.Options = append(opt.Options, "default_permissions")
+	}
 	if runtime.GOOS == "darwin" {
 		opt.Options = append(opt.Options, "fssubtype=juicefs", "volname="+conf.Format.Name)
 		opt.Options = append(opt.Options, "daemon_timeout=60", "iosize=65536", "novncache")
