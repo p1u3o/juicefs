@@ -296,6 +296,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *redisMeta) Shutdown() error {
+	m.of.close()
 	if m.cache != nil {
 		m.cache.close()
 		m.cache = nil
@@ -316,7 +317,7 @@ func (m *redisMeta) NewSession(record bool) error {
 
 func (m *redisMeta) doDeleteSlice(id uint64, size uint32) error {
 	ctx := Background()
-	if !m.fmt.ChangeLog {
+	if !m.getFormat().ChangeLog {
 		return m.rdb.HDel(ctx, m.sliceRefs(), m.sliceKey(id, size)).Err()
 	}
 	_, err := m.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
@@ -394,7 +395,7 @@ func (m *redisMeta) doInit(format *Format, force bool) error {
 	if err = m.rdb.Set(ctx, m.setting(), data, 0).Err(); err != nil {
 		return err
 	}
-	m.fmt = format
+	m.setFormat(format)
 	if body != nil {
 		return nil
 	}
@@ -444,15 +445,12 @@ func (m *redisMeta) doNewSession(sinfo []byte, update bool) error {
 	ctx := Background()
 	ssid := strconv.FormatUint(m.sid, 10)
 	expire := m.expireTime()
-	err := m.txn(ctx, func(tx *redis.Tx) error {
-		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.ZAdd(ctx, m.allSessions(), redis.Z{Score: float64(expire), Member: ssid})
-			pipe.HSet(ctx, m.sessionInfos(), ssid, sinfo)
-			m.genLog(ctx, pipe, time.Now(), "NEWSESSION(%d,%d,%s)", m.sid, expire, logEncode(sinfo))
-			return nil
-		})
-		return err
-	}, m.allSessions(), m.sessionInfos())
+	_, err := m.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.ZAdd(ctx, m.allSessions(), redis.Z{Score: float64(expire), Member: ssid})
+		pipe.HSet(ctx, m.sessionInfos(), ssid, sinfo)
+		m.genLog(ctx, pipe, time.Now(), "NEWSESSION(%d,%d,%s)", m.sid, expire, logEncode(sinfo))
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("new session %d: %s", m.sid, err)
 	}
@@ -488,7 +486,7 @@ func (m *redisMeta) incrCounter(name string, value int64) (int64, error) {
 
 	var v int64
 	var err error
-	if !m.fmt.ChangeLog {
+	if !m.getFormat().ChangeLog {
 		v, err = m.rdb.IncrBy(Background(), key, value).Result()
 	} else {
 		_, err = m.rdb.TxPipelined(Background(), func(pipe redis.Pipeliner) error {
@@ -1396,7 +1394,7 @@ func (m *redisMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode
 		dirtyAttr.Ctimensec = uint32(now.Nanosecond())
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.Set(ctx, m.inodeKey(inode), m.marshal(dirtyAttr), 0)
-			m.genLog(ctx, pipe, now, "SETATTR(%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d)", inode, set, sugidclearmode, dirtyAttr.Uid, dirtyAttr.Gid, dirtyAttr.Mode, dirtyAttr.Flags, dirtyAttr.Atime, dirtyAttr.Mtime, dirtyAttr.Atimensec, dirtyAttr.Mtimensec, dirtyAttr.Ctime, dirtyAttr.Ctimensec, dirtyAttr.AccessACL)
+			m.genLog(ctx, pipe, now, "SETATTR(%d,%d,%d,%s)", inode, set, sugidclearmode, dirtyAttr.logFields())
 			return nil
 		})
 		if err == nil {
@@ -1589,7 +1587,7 @@ func (m *redisMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, m
 			if behavior == nil {
 				behavior = runtime.GOOS
 			}
-			m.genLog(ctx, pipe, now, "CREATE(%d,%s,%d,%d,%d,%d,%d,%s,%s,%t):%d", parent, logEncode2(name), ctx.Uid(), ctx.Gid(), _type, mode, cumask, logEncode2(path), behavior, updateParent, *inode)
+			m.genLog(ctx, pipe, now, "CREATE(%d,%s,%d,%d,%d,%d,%d,%s,%s,%t,%d,%d):%d", parent, logEncode2(name), ctx.Uid(), ctx.Gid(), _type, mode, cumask, logEncode2(path), behavior, updateParent, attr.Rdev, attr.Mode, *inode)
 			return nil
 		})
 		return err
@@ -1605,7 +1603,7 @@ func (m *redisMeta) txnLastLog() string {
 }
 
 func (m *redisMeta) genLog(ctx Context, pipe redis.Pipeliner, ts time.Time, op string, args ...any) {
-	if !m.fmt.ChangeLog {
+	if !m.getFormat().ChangeLog {
 		return
 	}
 	op = fmt.Sprintf(op, args...)
@@ -1763,7 +1761,9 @@ func (m *redisMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, s
 	var _type uint8
 	var opened bool
 	var newSpace, newInode int64
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		trash = requestedTrash
 		opened = false
 		*attr = Attr{}
 		newSpace, newInode = 0, 0
@@ -1932,6 +1932,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 		opened bool
 		length uint64
 	}
+	skipFlags := ignoreAttrFlags(ctx)
 
 	// Each entry averages ~4 tx operations, so batch size should be 1000/4
 	batchSize := 1000 / 4
@@ -1975,7 +1976,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 			if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
 				return st
 			}
-			if (pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0 {
+			if !skipFlags && ((pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0) {
 				return syscall.EPERM
 			}
 
@@ -1990,6 +1991,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 			if err != nil {
 				return err
 			}
+			seenNames := make(map[string]struct{}, len(batch))
 			for idx, entry := range batch {
 				val := vals[idx]
 				if val == nil {
@@ -2000,8 +2002,13 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 				if entry.Inode != ino || typ == TypeDirectory || (entry.Attr != nil && entry.Attr.Typ != typ) {
 					continue
 				}
+				name := string(entry.Name)
+				if _, ok := seenNames[name]; ok {
+					continue
+				}
+				seenNames[name] = struct{}{}
 				entryInfos = append(entryInfos, &entryInfo{
-					name:  string(entry.Name),
+					name:  name,
 					inode: ino,
 					typ:   typ,
 					trash: trash,
@@ -2052,7 +2059,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 					if ctx.Uid() != 0 && pattr.Mode&01000 != 0 && ctx.Uid() != pattr.Uid && ctx.Uid() != attr.Uid {
 						return syscall.EACCES
 					}
-					if (attr.Flags&FlagAppend) != 0 || (attr.Flags&FlagImmutable) != 0 {
+					if !skipFlags && ((attr.Flags&FlagAppend) != 0 || (attr.Flags&FlagImmutable) != 0) {
 						return syscall.EPERM
 					}
 					if (attr.Flags & FlagSkipTrash) != 0 {
@@ -2115,7 +2122,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 			// collect data for batch operations
 			var names []string
 			var encodedNames []string
-			var inodeStrs []string
+			var results []string
 			var keys []string
 			var sustained []interface{}
 			var delfiles []redis.Z
@@ -2127,7 +2134,8 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 			for _, info := range entryInfos {
 				names = append(names, info.name)
 				encodedNames = append(encodedNames, logEncode2(info.name))
-				inodeStrs = append(inodeStrs, strconv.FormatUint(uint64(info.inode), 10))
+				dnode := delNodes[info.inode]
+				results = append(results, strconv.FormatUint(uint64(info.inode), 10), strconv.FormatBool(dnode != nil && dnode.opened))
 				if info.attr == nil {
 					continue
 				}
@@ -2266,7 +2274,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 				if updateParent {
 					pipe.Set(ctx, m.inodeKey(parent), m.marshal(&pattr), 0)
 				}
-				m.genLog(ctx, pipe, now, "UNLINKBATCH(%d,%s,%d,%t):%s", parent, strings.Join(encodedNames, ","), trash, updateParent, strings.Join(inodeStrs, ","))
+				m.genLog(ctx, pipe, now, "UNLINKBATCH(%d,%s,%d,%t):%s", parent, strings.Join(encodedNames, ","), trash, updateParent, strings.Join(results, ","))
 				return nil
 			})
 			return err
@@ -2303,7 +2311,9 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, o
 		}
 	}
 	var attr Attr
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		trash = requestedTrash
 		buf, err := tx.HGet(ctx, m.entryKey(parent), name).Bytes()
 		if err == redis.Nil && m.conf.CaseInsensi {
 			if e := m.resolveCase(ctx, parent, name); e != nil {
@@ -2341,7 +2351,7 @@ func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, o
 		if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, &pattr); st != 0 {
 			return st
 		}
-		if (pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0 {
+		if !ignoreAttrFlags(ctx) && ((pattr.Flags&FlagAppend) != 0 || (pattr.Flags&FlagImmutable) != 0) {
 			return syscall.EPERM
 		}
 		now := time.Now()
@@ -2434,7 +2444,9 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			return st
 		}
 	}
+	requestedTrash := trash
 	err := m.txn(ctx, func(tx *redis.Tx) error {
+		trash = requestedTrash
 		opened = false
 		dino, dtyp = 0, 0
 		tattr = Attr{}
@@ -2490,16 +2502,8 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 		if err := tx.Watch(ctx, keys...).Err(); err != nil {
 			return err
 		}
-		if dino > 0 {
-			if ino == dino {
-				return errno(nil)
-			}
-			if exchange {
-			} else if typ == TypeDirectory && dtyp != TypeDirectory {
-				return syscall.ENOTDIR
-			} else if typ != TypeDirectory && dtyp == TypeDirectory {
-				return syscall.EISDIR
-			}
+		if dino > 0 && ino == dino {
+			return errno(nil)
 		}
 
 		keys = []string{m.inodeKey(parentSrc), m.inodeKey(parentDst), m.inodeKey(ino)}
@@ -2543,6 +2547,15 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			ctx.Uid() != iattr.Uid && (ctx.Uid() != sattr.Uid || iattr.Typ == TypeDirectory) {
 			return syscall.EACCES
 		}
+		if dino > 0 && !exchange {
+			if ctx.Uid() != 0 && sattr.Mode&01000 != 0 && ctx.Uid() != sattr.Uid && ctx.Uid() != iattr.Uid {
+				return syscall.EACCES
+			} else if typ == TypeDirectory && dtyp != TypeDirectory {
+				return syscall.ENOTDIR
+			} else if typ != TypeDirectory && dtyp == TypeDirectory {
+				return syscall.EISDIR
+			}
+		}
 
 		var supdate, dupdate bool
 		now := time.Now()
@@ -2557,6 +2570,9 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 				return syscall.EPERM
 			}
 			if (tattr.Flags & FlagSkipTrash) != 0 {
+				trash = 0
+			}
+			if !exchange && trash > 0 && tattr.Nlink > 1 && tx.HExists(ctx, m.entryKey(trash), m.trashEntry(parentDst, dino, nameDst)).Val() {
 				trash = 0
 			}
 			tattr.Ctime = now.Unix()
@@ -2722,7 +2738,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 			if dupdate {
 				pipe.Set(ctx, m.inodeKey(parentDst), m.marshal(&dattr), 0)
 			}
-			m.genLog(ctx, pipe, now, "MOVE(%d,%s,%d,%s,%d,%d,%d):%d", parentSrc, logEncode2(nameSrc), parentDst, logEncode2(nameDst), flags, dino, trash, ino)
+			m.genLog(ctx, pipe, now, "MOVE(%d,%s,%d,%s,%d,%d,%d,%t):%d", parentSrc, logEncode2(nameSrc), parentDst, logEncode2(nameDst), flags, dino, trash, opened, ino)
 			return nil
 		})
 		return err
@@ -2967,15 +2983,12 @@ func (m *redisMeta) doCleanStaleSession(sid uint64) error {
 		return fmt.Errorf("failed to clean up sid %d", sid)
 	} else {
 		var removed *redis.IntCmd
-		if err := m.txn(ctx, func(tx *redis.Tx) error {
-			_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.HDel(ctx, m.sessionInfos(), ssid)
-				removed = pipe.ZRem(ctx, m.allSessions(), ssid)
-				m.genLog(ctx, pipe, time.Now(), "CLEANSESSION(%d)", sid)
-				return nil
-			})
-			return err
-		}, m.sessionInfos(), m.allSessions()); err != nil {
+		if _, err := m.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HDel(ctx, m.sessionInfos(), ssid)
+			removed = pipe.ZRem(ctx, m.allSessions(), ssid)
+			m.genLog(ctx, pipe, time.Now(), "CLEANSESSION(%d)", sid)
+			return nil
+		}); err != nil {
 			return err
 		}
 		if n, err := removed.Result(); err != nil {
@@ -3024,26 +3037,19 @@ func (m *redisMeta) doRefreshSession() error {
 	ctx := Background()
 	ssid := strconv.FormatUint(m.sid, 10)
 	expire := m.expireTime()
-	return m.txn(ctx, func(tx *redis.Tx) error {
-		ok, err := tx.HExists(ctx, m.sessionInfos(), ssid).Result()
-		if err != nil {
-			return err
-		}
-		if !ok {
-			logger.Warnf("Session %d was stale and cleaned up, but now it comes back again", m.sid)
-		}
-		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			if !ok {
-				pipe.HSet(ctx, m.sessionInfos(), ssid, m.newSessionInfo())
-			}
-			pipe.ZAdd(ctx, m.allSessions(), redis.Z{
-				Score:  float64(expire),
-				Member: ssid,
-			})
-			return nil
+	var created *redis.BoolCmd
+	_, err := m.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		created = pipe.HSetNX(ctx, m.sessionInfos(), ssid, m.currentSessionInfo())
+		pipe.ZAdd(ctx, m.allSessions(), redis.Z{
+			Score:  float64(expire),
+			Member: ssid,
 		})
-		return err
-	}, m.sessionInfos(), m.allSessions())
+		return nil
+	})
+	if err == nil && created.Val() {
+		logger.Warnf("Session %d was stale and cleaned up, but now I'm back again", m.sid)
+	}
+	return err
 }
 
 func (m *redisMeta) doDeleteSustainedInode(sid uint64, inode Ino) error {
@@ -3439,7 +3445,7 @@ func (m *redisMeta) doGetDirStat(ctx Context, ino Ino, trySync bool) (*dirStat, 
 		return nil, errno(errSpace)
 	}
 	usedInodes, errInodes := m.rdb.HGet(ctx, m.dirUsedInodesKey(), field).Int64()
-	if errInodes != nil && errSpace != redis.Nil {
+	if errInodes != nil && errInodes != redis.Nil {
 		return nil, errno(errInodes)
 	}
 	if errLength != redis.Nil && errSpace != redis.Nil && errInodes != redis.Nil {
@@ -3982,15 +3988,33 @@ func (m *redisMeta) hscan(ctx context.Context, key string, f func([]string) erro
 	return nil
 }
 
-func (m *redisMeta) ListSlices(ctx Context, slices map[Ino][]Slice, scanPending, delete bool, showProgress func()) syscall.Errno {
-	logger.Debugf("start cleanup...")
-	m.cleanupLeakedInodes(delete)
-	m.cleanupLeakedChunks(delete)
-	m.cleanupOldSliceRefs(delete)
-	if delete {
-		_ = m.doCleanupSlices(ctx, nil)
+func (m *redisMeta) hscanToMap(ctx context.Context, key string) (map[string]string, error) {
+	result := make(map[string]string)
+	err := m.hscan(ctx, key, func(keys []string) error {
+		if len(keys)%2 != 0 {
+			return fmt.Errorf("invalid HSCAN response for %s: odd number of elements: %d", key, len(keys))
+		}
+		for i := 0; i < len(keys); i += 2 {
+			result[keys[i]] = keys[i+1]
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	logger.Debugf("start listing slices...")
+	return result, nil
+}
+
+func (m *redisMeta) CleanupSlices(ctx Context) syscall.Errno {
+	logger.Debugf("start cleanup...")
+	m.cleanupLeakedInodes(true)
+	m.cleanupLeakedChunks(true)
+	m.cleanupOldSliceRefs(true)
+	return m.baseMeta.CleanupSlices(ctx)
+}
+
+func (m *redisMeta) ScanSlices(ctx Context, opt *ScanSlicesOption, fn func(Ino, Slice) error) syscall.Errno {
+	logger.Debugf("start scanning slices...")
 
 	p := m.rdb.Pipeline()
 	err := m.scan(ctx, "c*_*", func(keys []string) error {
@@ -4017,9 +4041,11 @@ func (m *redisMeta) ListSlices(ctx Context, slices map[Ino][]Slice, scanPending,
 			}
 			for _, s := range ss {
 				if s.id > 0 {
-					slices[Ino(inode)] = append(slices[Ino(inode)], Slice{Id: s.id, Size: s.size})
-					if showProgress != nil {
-						showProgress()
+					if err := fn(Ino(inode), Slice{Id: s.id, Size: s.size}); err != nil {
+						return err
+					}
+					if opt.Progress != nil {
+						opt.Progress()
 					}
 				}
 			}
@@ -4031,8 +4057,8 @@ func (m *redisMeta) ListSlices(ctx Context, slices map[Ino][]Slice, scanPending,
 		return errno(err)
 	}
 
-	if scanPending {
-		_ = m.hscan(Background(), m.sliceRefs(), func(keys []string) error {
+	if opt.ScanPending {
+		if err := m.hscan(ctx, m.sliceRefs(), func(keys []string) error {
 			for i := 0; i < len(keys); i += 2 {
 				key, val := keys[i], keys[i+1]
 				if strings.HasPrefix(val, "-") { // < 0
@@ -4041,23 +4067,30 @@ func (m *redisMeta) ListSlices(ctx Context, slices map[Ino][]Slice, scanPending,
 						id, _ := strconv.ParseUint(ps[0][1:], 10, 64)
 						size, _ := strconv.ParseUint(ps[1], 10, 32)
 						if id > 0 && size > 0 {
-							slices[0] = append(slices[0], Slice{Id: id, Size: uint32(size)})
+							if err := fn(0, Slice{Id: id, Size: uint32(size)}); err != nil {
+								return err
+							}
 						}
 					}
 				}
 			}
 			return nil
-		})
+		}); err != nil {
+			logger.Warnf("scan pending slices: %s", err)
+			return errno(err)
+		}
 	}
 
 	if m.getFormat().TrashDays == 0 {
 		return 0
 	}
 	return errno(m.scanTrashSlices(ctx, func(ss []Slice, _ int64) (bool, error) {
-		slices[1] = append(slices[1], ss...)
-		if showProgress != nil {
-			for range ss {
-				showProgress()
+		for _, s := range ss {
+			if err := fn(1, s); err != nil {
+				return false, err
+			}
+			if opt.Progress != nil {
+				opt.Progress()
 			}
 		}
 		return false, nil
@@ -4235,22 +4268,24 @@ func (m *redisMeta) scanPendingFiles(ctx Context, scan pendingFileScan) error {
 	return nil
 }
 
-func (m *redisMeta) doRepair(ctx Context, inode Ino, attr *Attr) syscall.Errno {
+func (m *redisMeta) doRepair(ctx Context, inode Ino, attr *Attr, trustNlink bool) syscall.Errno {
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
-		attr.Nlink = 2
-		vals, err := tx.HGetAll(ctx, m.entryKey(inode)).Result()
-		if err != nil {
-			return err
-		}
-		for _, v := range vals {
-			typ, _ := m.parseEntry([]byte(v))
-			if typ == TypeDirectory {
-				attr.Nlink++
+		if !trustNlink {
+			attr.Nlink = 2
+			vals, err := tx.HGetAll(ctx, m.entryKey(inode)).Result()
+			if err != nil {
+				return err
+			}
+			for _, v := range vals {
+				typ, _ := m.parseEntry([]byte(v))
+				if typ == TypeDirectory {
+					attr.Nlink++
+				}
 			}
 		}
-		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
-			m.genLog(ctx, pipe, time.Now(), "REPAIRDIR(%d)", inode)
+			m.genLog(ctx, pipe, time.Now(), "REPAIRDIR(%d,%s)", inode, attr.logFields())
 			return nil
 		})
 		return err
@@ -4292,11 +4327,19 @@ func (m *redisMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Err
 }
 
 func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
-	key := m.xattrKey(inode)
+	inodeKey := m.inodeKey(inode)
+	xattrKey := m.xattrKey(inode)
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+		exists, err := tx.Exists(ctx, inodeKey).Result()
+		if err != nil {
+			return err
+		}
+		if exists == 0 {
+			return syscall.ENOENT
+		}
 		switch flags {
 		case XattrCreate:
-			ok, err := tx.HExists(ctx, key, name).Result()
+			ok, err := tx.HExists(ctx, xattrKey, name).Result()
 			if err != nil {
 				return err
 			}
@@ -4304,7 +4347,7 @@ func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte
 				return syscall.EEXIST
 			}
 		case XattrReplace:
-			ok, err := tx.HExists(ctx, key, name).Result()
+			ok, err := tx.HExists(ctx, xattrKey, name).Result()
 			if err != nil {
 				return err
 			}
@@ -4312,20 +4355,29 @@ func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte
 				return ENOATTR
 			}
 		}
-		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.HSet(ctx, key, name, value)
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HSet(ctx, xattrKey, name, value)
 			m.genLog(ctx, pipe, time.Now(), "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
 			return nil
 		})
 		return err
-	}, key))
+	}, inodeKey, xattrKey))
 }
 
 func (m *redisMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
+	inodeKey := m.inodeKey(inode)
+	xattrKey := m.xattrKey(inode)
 	var n int64
 	err := m.txn(ctx, func(tx *redis.Tx) error {
-		cmd, err := tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.HDel(ctx, m.xattrKey(inode), name)
+		exists, err := tx.Exists(ctx, inodeKey).Result()
+		if err != nil {
+			return err
+		}
+		if exists == 0 {
+			return syscall.ENOENT
+		}
+		cmd, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HDel(ctx, xattrKey, name)
 			m.genLog(ctx, pipe, time.Now(), "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
 			return nil
 		})
@@ -4335,7 +4387,7 @@ func (m *redisMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.E
 			}
 		}
 		return err
-	}, m.xattrKey(inode))
+	}, inodeKey, xattrKey)
 	if err != nil {
 		return errno(err)
 	} else if n == 0 {
@@ -4451,7 +4503,7 @@ func (m *redisMeta) doSetQuota(ctx Context, qtype uint32, key uint64, quota *Quo
 			} else if created {
 				pipe.HSet(ctx, config.usedInodesKey, field, 0)
 			}
-			m.genLog(ctx, pipe, time.Now(), "SETQUOTA(%d,%d,%d,%d)", qtype, key, quota.MaxSpace, quota.MaxInodes)
+			m.genLog(ctx, pipe, time.Now(), "SETQUOTA(%d,%d,%d,%d,%d,%d)", qtype, key, quota.MaxSpace, quota.MaxInodes, quota.UsedSpace, quota.UsedInodes)
 			return nil
 		})
 		return e
@@ -4507,46 +4559,55 @@ func (m *redisMeta) doLoadQuotas(ctx Context) (map[uint64]*Quota, map[uint64]*Qu
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to load %s quotas: %w", qt.name, err)
 		}
-		if err := m.hscan(ctx, config.usedInodesKey, func(keys []string) error {
-			for i := 0; i < len(keys); i += 2 {
-				key := keys[i]
-				id, err := strconv.ParseUint(key, 10, 64)
-				if err != nil {
-					logger.Errorf("invalid key in %s: %s", qt.name, key)
+
+		usedInodesMap, err := m.hscanToMap(ctx, config.usedInodesKey)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		usedSpaceMap, err := m.hscanToMap(ctx, config.usedSpaceKey)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		quotaMap, err := m.hscanToMap(ctx, config.quotaKey)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		for key, usedInodesStr := range usedInodesMap {
+			id, err := strconv.ParseUint(key, 10, 64)
+			if err != nil {
+				logger.Errorf("invalid key in %s: %s", qt.name, key)
+				continue
+			}
+			usedInodes, err := strconv.ParseInt(usedInodesStr, 10, 64)
+			if err != nil {
+				logger.Errorf("invalid usedInodes for %s %s: %s", qt.name, key, usedInodesStr)
+				continue
+			}
+
+			var usedSpace int64
+			if v, ok := usedSpaceMap[key]; ok {
+				if usedSpace, err = strconv.ParseInt(v, 10, 64); err != nil {
+					logger.Errorf("invalid usedSpace for %s %s: %s", qt.name, key, v)
 					continue
-				}
-				usedInodes, err := strconv.ParseInt(keys[i+1], 10, 64)
-				if err != nil {
-					logger.Errorf("invalid usedInodes for %s %s: %s", qt.name, key, keys[i+1])
-					continue
-				}
-
-				usedSpace, err := m.rdb.HGet(ctx, config.usedSpaceKey, key).Int64()
-				if err != nil && err != redis.Nil {
-					return err
-				}
-
-				var maxSpace, maxInodes int64 = -1, -1
-				if buf, err := m.rdb.HGet(ctx, config.quotaKey, key).Bytes(); err == nil {
-					if len(buf) != 16 {
-						logger.Errorf("invalid quota value for %s %s: len=%d", qt.name, key, len(buf))
-						continue
-					}
-					maxSpace, maxInodes = m.parseQuota(buf)
-				} else if err != redis.Nil {
-					return err
-				}
-
-				qt.quotas[id] = &Quota{
-					MaxSpace:   maxSpace,
-					MaxInodes:  maxInodes,
-					UsedSpace:  usedSpace,
-					UsedInodes: usedInodes,
 				}
 			}
-			return nil
-		}); err != nil {
-			return nil, nil, nil, err
+
+			var maxSpace, maxInodes int64 = -1, -1
+			if v, ok := quotaMap[key]; ok {
+				if len(v) != 16 {
+					logger.Errorf("invalid quota value for %s %s: len=%d", qt.name, key, len(v))
+					continue
+				}
+				maxSpace, maxInodes = m.parseQuota([]byte(v))
+			}
+
+			qt.quotas[id] = &Quota{
+				MaxSpace:   maxSpace,
+				MaxInodes:  maxInodes,
+				UsedSpace:  usedSpace,
+				UsedInodes: usedInodes,
+			}
 		}
 	}
 
@@ -5011,6 +5072,7 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fas
 		return err
 	}
 	progress := utils.NewProgress(false)
+	defer progress.Done()
 	bar := progress.AddCountBar("Dumped entries", 1) // with root
 	useTotal := root == RootInode && !skipTrash
 	if useTotal {
@@ -5059,7 +5121,6 @@ func (m *redisMeta) DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fas
 	if _, err = bw.WriteString("\n}\n"); err != nil {
 		return err
 	}
-	progress.Done()
 
 	return bw.Flush()
 }
@@ -5185,9 +5246,7 @@ func (m *redisMeta) LoadMeta(r io.Reader) (err error) {
 	if err != nil {
 		return err
 	}
-	m.Lock()
-	m.fmt = &dm.Setting
-	m.Unlock()
+	m.setFormat(&dm.Setting)
 	if err = m.loadDumpedACLs(ctx); err != nil {
 		return err
 	}
@@ -5352,7 +5411,6 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 			} else {
 				p.HSet(ctx, m.entryKey(parent), name, m.packEntry(attr.Typ, ino))
 				if top {
-					now := time.Now()
 					pattr.Mtime = now.Unix()
 					pattr.Mtimensec = uint32(now.Nanosecond())
 					pattr.Ctime = now.Unix()
@@ -5405,10 +5463,14 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 				}
 				p.Set(ctx, m.symKey(ino), path, 0)
 			}
-			m.genLog(ctx, p, time.Now(), "CLONE(%d,%d,%s,%d,%d,%d,%t):%d", srcIno, parent, logEncode2(name), ino, cmode, cumask, top, ino)
+			m.genLog(ctx, p, now, "CLONE(%d,%d,%s,%d,%d,%d,%t,%d,%s):%d", srcIno, parent, logEncode2(name), ino, cmode, cumask, top, ctx.Uid(), logGids(ctx), ino)
 			return nil
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		*originAttr = attr
+		return nil
 	}, m.inodeKey(srcIno), m.xattrKey(srcIno)))
 }
 
@@ -5710,6 +5772,15 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 						p.HIncrBy(ctx, m.sliceRefs(), field, delta)
 					}
 				}
+				if m.getFormat().ChangeLog && len(validInfos) > 0 {
+					args := make([]string, 0, 2*len(validInfos))
+					inodes := make([]string, 0, len(validInfos))
+					for _, info := range validInfos {
+						args = append(args, strconv.FormatUint(uint64(info.srcIno), 10), logEncode2(string(info.entry.Name)))
+						inodes = append(inodes, strconv.FormatUint(uint64(info.dstIno), 10))
+					}
+					m.genLog(ctx, p, now, "CLONEBATCH(%d,%d,%d,%d,%s,%s):%s", dstParent, cmode, cumask, ctx.Uid(), logGids(ctx), strings.Join(args, ","), strings.Join(inodes, ","))
+				}
 				return nil
 			})
 			return err
@@ -5735,8 +5806,8 @@ func (m *redisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 	if err != nil || exists == 0 {
 		return errno(err)
 	}
-	rmConcurrent := make(chan int, 10)
-	if eno := m.emptyDir(ctx, ino, true, nil, rmConcurrent); eno != 0 {
+	rmConcurrent := make(chan int, backgroundDeleteThreads)
+	if eno := m.emptyDir(withIgnoredAttrFlags(ctx), ino, true, nil, rmConcurrent); eno != 0 {
 		return eno
 	}
 	m.updateStats(-align4K(0), -1)
@@ -5892,7 +5963,7 @@ func (m *redisMeta) doSetFacl(ctx Context, ino Ino, aclType uint8, rule *aclAPI.
 			attr.Ctimensec = uint32(now.Nanosecond())
 			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 				pipe.Set(ctx, m.inodeKey(ino), m.marshal(attr), 0)
-				m.genLog(ctx, pipe, now, "SETFACL(%d,%d,%s)", ino, aclType, logEncode(rule.Encode()))
+				m.genLog(ctx, pipe, now, "SETFACL(%d,%d,%s,%d)", ino, aclType, logEncode(rule.Encode()), attr.Mode)
 				return nil
 			})
 			return err
@@ -5956,6 +6027,9 @@ func (m *redisMeta) getACL(ctx Context, tx *redis.Tx, id uint32) (*aclAPI.Rule, 
 func (m *redisMeta) insertACL(ctx Context, tx *redis.Tx, rule *aclAPI.Rule) (uint32, error) {
 	if rule == nil || rule.IsEmpty() {
 		return aclAPI.None, nil
+	}
+	if aclId := m.aclCache.GetId(rule); aclId != aclAPI.None {
+		return aclId, nil
 	}
 
 	if err := m.tryLoadMissACLs(ctx, tx); err != nil {
